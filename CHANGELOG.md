@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added an opt-in raw MCP result archive that captures proxy, direct, and `mcpScript` `callTool` results before output guarding, with private content-addressed storage, per-server controls, and payload size limits.
+
 ## [2.20.1] - 2026-08-04
 
 ### Fixed

@@ -199,6 +199,7 @@ In the configuration examples below, `30000` is illustrative only. If `requestTi
 | `excludeTools` | `string[]` of tool names or glob patterns to hide (applied after `includeTools`) |
 | `debug` | Show server stderr (default: false) |
 | `trace` | Enable metadata-only JSONL protocol tracing for this server; payloads, prompts, tool arguments/results, authorization data, and URLs are never persisted |
+| `resultArchive` | Override global raw MCP result archiving for this server. This persists tool arguments and unguarded results; review the security warning below. |
 | `disabled` | Keep the server visible in config and status, but prevent connections, authentication, tools, and resource calls (only literal `true` disables it) |
 
 #### Protocol version negotiation
@@ -275,6 +276,13 @@ When any enabled server uses `eager` or `keep-alive`, initialization also starts
     "hostConfigDiscovery": "off",
     "approveTools": ["github_delete_*", "notion_update_*"],
     "oauthDir": ".pi/mcp-oauth",
+    "resultArchive": {
+      "enabled": true,
+      "directory": "~/.pi/agent/mcp-results",
+      "servers": ["figma-desktop"],
+      "maxBytes": 52428800,
+      "maxArgumentBytes": 1048576
+    },
     "trace": {
       "enabled": true,
       "file": ".pi/mcp-traces/mcp.jsonl",
@@ -306,6 +314,7 @@ When any enabled server uses `eager` or `keep-alive`, initialization also starts
 | `samplingAutoApprove` | Skip sampling confirmation prompts. Required for sampling in non-UI sessions (default: false). |
 | `elicitation` | Allow MCP servers to request user input through Pi dialogs (default: true when Pi UI is available). |
 | `outputGuard` | Guard oversized MCP output: `true` (default), `false`, or `{ maxBytes, maxLines, detailsMaxBytes }`. See [Output Guard](#output-guard). |
+| `resultArchive` | Opt-in raw MCP tool result archive: `true`, `false`, or `{ enabled, directory, servers, maxBytes, maxArgumentBytes }`. Disabled by default. See [Raw Result Archive](#raw-result-archive). |
 | `trace` | Opt-in metadata-only protocol tracing. Set `{ enabled: true }` globally or `trace: true` on a server. The per-session JSONL file defaults to `.pi/mcp-traces/`; `file`, `maxBytes` (default 262144), and `maxEvents` (default 10000) can be set. Raw MCP payloads, prompts, tool arguments/results, auth data, and URLs are never persisted. |
 
 Per-server `idleTimeout`, `requestTimeoutMs`, and `approveTools` override the global settings. `debug` remains stderr display and is unrelated to protocol tracing.
@@ -364,6 +373,38 @@ Tune the limits with the object form:
 ```
 
 Set `"outputGuard": false` — or the env kill switch `MCP_OUTPUT_GUARD=0` — to disable the guard and restore raw output behavior. Saved temp files are created with mode `0600` under the system temp directory and are not cleaned up automatically; note that spilled MCP output may contain sensitive data.
+
+### Raw Result Archive
+
+Raw result archiving is disabled by default. When enabled, the adapter saves successful and MCP-level error results immediately after `callTool` returns and **before** output guarding or model-facing truncation. Proxy, direct, and `mcpScript` calls share the same archive path.
+
+```json
+{
+  "settings": {
+    "resultArchive": {
+      "enabled": true,
+      "directory": "~/.pi/agent/mcp-results",
+      "servers": ["figma-desktop"],
+      "maxBytes": 52428800,
+      "maxArgumentBytes": 1048576
+    }
+  }
+}
+```
+
+The archive is append-only and uses SHA-256 content-addressed objects:
+
+```text
+mcp-results/
+├── entries/<server>/<date>/*.json
+└── objects/<sha-prefix>/<sha256>
+```
+
+Text is stored as UTF-8, valid base64 images are decoded to their original bytes, and tool arguments, structured content, `_meta`, extra result fields, and unknown content blocks are stored as content-addressed objects. Repeated payloads share the same object. Arguments larger than `maxArgumentBytes` (default 1 MiB) are represented only by their hash and byte count. On macOS and Linux, directories are created with mode `0700` and files with mode `0600`. Results larger than `maxBytes` (default 50 MiB) produce an omission entry instead of persisting payload objects. Windows is currently unsupported because the adapter does not yet provision a private ACL; enabled calls warn and continue without archiving rather than writing raw data with unsafe permissions.
+
+**Security warning:** this feature intentionally persists raw tool arguments and unguarded MCP results. They may contain secrets, personal data, proprietary designs, source code, or images. Keep the archive local, exclude it from version control and backups unless explicitly intended, and use the `servers` allowlist. Per-server `resultArchive: true | false` overrides the global enablement. `MCP_RESULT_ARCHIVE=0|1` and `MCP_RESULT_ARCHIVE_DIR=/path` provide environment overrides.
+
+This is an archive only: it never serves old data instead of making a live MCP call, so stale results cannot silently change tool behavior.
 
 ### MCP Scripting
 

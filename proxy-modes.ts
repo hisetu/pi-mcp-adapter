@@ -12,6 +12,7 @@ import { renderTsShape } from "./ts-shape.ts";
 import { reconstructPromptMetadata } from "./metadata-cache.ts";
 import { resolveMcpResultContent, transformMcpContent } from "./tool-registrar.ts";
 import { guardMcpOutput, guardedMcpDetails, resolveMcpOutputGuardOptions } from "./mcp-output-guard.ts";
+import { archiveMcpToolResultSafely } from "./mcp-result-archive.ts";
 import { maybeStartUiSession, summarizeUiSessionResult, type UiSessionRuntime } from "./ui-session.ts";
 import { formatAuthRequiredMessage, formatMcpStatus, resolveServerUrl, truncateAtWord } from "./utils.ts";
 import { authenticate, completeAuthFromInput, startAuth, supportsOAuth } from "./mcp-auth-flow.ts";
@@ -1141,6 +1142,16 @@ export async function executeCall(
         _meta: uiSession?.requestMeta,
       }, requestOptions), ownedSignal),
     );
+
+    await archiveMcpToolResultSafely({
+      settings: state.config.settings,
+      definition: state.config.mcpServers[serverName],
+      serverName,
+      toolName: toolMeta.originalName,
+      arguments: args ?? {},
+      origin: origin ?? "proxy",
+      result,
+    });
 
     if (toolMeta.uiResourceUri) {
       uiSession?.sendToolResult(result as unknown as import("@modelcontextprotocol/client").CallToolResult);

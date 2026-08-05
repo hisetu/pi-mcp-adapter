@@ -10,6 +10,7 @@ export { getMissingConfiguredDirectToolServers } from "./metadata-cache.ts";
 import { formatSchema } from "./tool-metadata.ts";
 import { resolveMcpResultContent, transformMcpContent } from "./tool-registrar.ts";
 import { guardMcpOutput, guardedMcpDetails, resolveMcpOutputGuardOptions } from "./mcp-output-guard.ts";
+import { archiveMcpToolResultSafely } from "./mcp-result-archive.ts";
 import { maybeStartUiSession, summarizeUiSessionResult, type UiSessionRuntime } from "./ui-session.ts";
 import { formatToolName, isServerDisabled, isToolAllowed, resolveToolPrefix } from "./types.ts";
 import { resourceNameToToolName } from "./resource-tools.ts";
@@ -483,6 +484,15 @@ export function createDirectToolExecutor(
           _meta: uiSession?.requestMeta,
         }, requestOptions), ownedSignal),
       );
+      await archiveMcpToolResultSafely({
+        settings: state.config.settings,
+        definition,
+        serverName: spec.serverName,
+        toolName: spec.originalName,
+        arguments: params ?? {},
+        origin: "direct",
+        result,
+      });
       uiSession?.sendToolResult(result as unknown as import("@modelcontextprotocol/client").CallToolResult);
 
       if (result.isError) {

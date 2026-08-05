@@ -397,6 +397,8 @@ export interface ServerEntry {
   debug?: boolean;  // Show server stderr (default: false)
   /** Enable metadata-only JSONL protocol tracing for this server. */
   trace?: boolean;
+  /** Override settings.resultArchive for this server. Raw arguments/results may contain sensitive data. */
+  resultArchive?: boolean;
   /**
    * MCP protocol era negotiation for this server. Defaults to `"legacy"`
    * (byte-equivalent to pre-2026 behavior — no `versionNegotiation` is sent).
@@ -438,6 +440,19 @@ export interface McpTraceSettings {
   maxBytes?: number;
   /** Maximum events retained in the per-session trace file. */
   maxEvents?: number;
+}
+
+export interface McpResultArchiveSettings {
+  /** Enable raw result archiving. Object form defaults to enabled unless this is false. */
+  enabled?: boolean;
+  /** Archive directory. Defaults to ~/.pi/agent/mcp-results; relative paths resolve from process.cwd(). */
+  directory?: string;
+  /** Optional allowlist of MCP server names. */
+  servers?: string[];
+  /** Maximum serialized raw result bytes archived per call. Defaults to 50 MiB. */
+  maxBytes?: number;
+  /** Maximum serialized tool argument bytes archived per call. Defaults to 1 MiB. */
+  maxArgumentBytes?: number;
 }
 
 export const MCP_TOOL_APPROVAL_REQUEST_EVENT = "pi-mcp-adapter:tool-approval-request" as const;
@@ -489,6 +504,13 @@ export interface McpSettings {
    * the limits. Env kill switch: MCP_OUTPUT_GUARD=0.
    */
   outputGuard?: boolean | McpOutputGuardSettings;
+  /**
+   * Opt-in raw MCP tool result archive. Stores tool arguments and unguarded
+   * results in private content-addressed files. Disabled by default because
+   * payloads can contain secrets, personal data, and proprietary content.
+   * Env overrides: MCP_RESULT_ARCHIVE and MCP_RESULT_ARCHIVE_DIR.
+   */
+  resultArchive?: boolean | McpResultArchiveSettings;
   /**
    * Opt-in metadata-only MCP protocol tracing. Payloads, prompts, tool
    * arguments/results, authorization data, and URLs are never persisted.
