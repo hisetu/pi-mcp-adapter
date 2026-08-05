@@ -283,6 +283,12 @@ When any enabled server uses `eager` or `keep-alive`, initialization also starts
       "maxBytes": 52428800,
       "maxArgumentBytes": 1048576
     },
+    "resultCache": {
+      "enabled": true,
+      "allowTools": ["figma-desktop/get_design_context"],
+      "defaultMaxAgeSeconds": 3600,
+      "requireNodeId": true
+    },
     "trace": {
       "enabled": true,
       "file": ".pi/mcp-traces/mcp.jsonl",
@@ -315,6 +321,7 @@ When any enabled server uses `eager` or `keep-alive`, initialization also starts
 | `elicitation` | Allow MCP servers to request user input through Pi dialogs (default: true when Pi UI is available). |
 | `outputGuard` | Guard oversized MCP output: `true` (default), `false`, or `{ maxBytes, maxLines, detailsMaxBytes }`. See [Output Guard](#output-guard). |
 | `resultArchive` | Opt-in raw MCP tool result archive: `true`, `false`, or `{ enabled, directory, servers, maxBytes, maxArgumentBytes }`. Disabled by default. See [Raw Result Archive](#raw-result-archive). |
+| `resultCache` | Explicit namespace-based read-through cache used by `mcpCache`: `true`, `false`, or `{ enabled, allowTools, defaultMaxAgeSeconds, requireNodeId }`. Disabled by default. |
 | `trace` | Opt-in metadata-only protocol tracing. Set `{ enabled: true }` globally or `trace: true` on a server. The per-session JSONL file defaults to `.pi/mcp-traces/`; `file`, `maxBytes` (default 262144), and `maxEvents` (default 10000) can be set. Raw MCP payloads, prompts, tool arguments/results, auth data, and URLs are never persisted. |
 
 Per-server `idleTimeout`, `requestTimeoutMs`, and `approveTools` override the global settings. `debug` remains stderr display and is unrelated to protocol tracing.
@@ -404,7 +411,38 @@ Text is stored as UTF-8, valid base64 images are decoded to their original bytes
 
 **Security warning:** this feature intentionally persists raw tool arguments and unguarded MCP results. They may contain secrets, personal data, proprietary designs, source code, or images. Keep the archive local, exclude it from version control and backups unless explicitly intended, and use the `servers` allowlist. Per-server `resultArchive: true | false` overrides the global enablement. `MCP_RESULT_ARCHIVE=0|1` and `MCP_RESULT_ARCHIVE_DIR=/path` provide environment overrides.
 
-This is an archive only: it never serves old data instead of making a live MCP call, so stale results cannot silently change tool behavior.
+Raw archiving alone never serves old data instead of making a live MCP call. To opt into read-through behavior, keep `resultArchive` enabled for the target server, enable `resultCache`, and call the separate `mcpCache` tool with a stable namespace such as a Figma file key. The cache tool is registered only when `resultCache` is enabled, independently of `scriptMode`:
+
+```json
+{
+  "settings": {
+    "resultCache": {
+      "enabled": true,
+      "allowTools": [
+        "figma-desktop/get_design_context",
+        "figma-desktop/get_metadata",
+        "figma-desktop/get_screenshot",
+        "figma-desktop/get_variable_defs"
+      ],
+      "defaultMaxAgeSeconds": 3600,
+      "requireNodeId": true
+    }
+  }
+}
+```
+
+```js
+mcpCache({
+  server: "figma-desktop",
+  tool: "get_design_context",
+  namespace: "your-figma-file-key",
+  args: { nodeId: "123:456", clientLanguages: "dart", clientFrameworks: "flutter" },
+  policy: "prefer-cache",
+  maxAgeSeconds: 3600
+})
+```
+
+`prefer-cache` returns a valid hit without contacting the MCP server, `cache-only` never makes a live call, and `refresh` always calls the server and updates the pointer. Only exact `server/original-tool` entries in `allowTools` can run. With `requireNodeId` enabled (the default), dynamic current-selection requests are rejected. MCP error results and oversized archived results are never published as hits.
 
 ### MCP Scripting
 

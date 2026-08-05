@@ -1,11 +1,13 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   archiveMcpToolResult,
   archiveMcpToolResultSafely,
+  computeMcpResultCacheKey,
+  readMcpResultCache,
   DEFAULT_MCP_RESULT_ARCHIVE_MAX_ARGUMENT_BYTES,
   DEFAULT_MCP_RESULT_ARCHIVE_MAX_BYTES,
   resolveMcpResultArchiveOptions,
@@ -114,6 +116,118 @@ describe("archiveMcpToolResult", () => {
 
     const objectFiles = await collectFiles(join(archive, "objects"));
     expect(objectFiles).toHaveLength(6);
+  });
+
+  it("restores a namespaced cached result with canonical argument ordering", async () => {
+    const root = await makeTempRoot();
+    const archive = join(root, "archive");
+    const settings = { resultArchive: { directory: archive } };
+    const image = Buffer.from("image-bytes");
+    await archiveMcpToolResult({
+      settings,
+      serverName: "figma-desktop",
+      toolName: "get_design_context",
+      namespace: "file-key-1",
+      arguments: { nodeId: "1:2", options: { b: 2, a: 1 } },
+      origin: "proxy",
+      result: {
+        content: [
+          { type: "text", text: "cached design" },
+          { type: "image", data: image.toString("base64"), mimeType: "image/png" },
+        ],
+        isError: false,
+        structuredContent: { ok: true },
+        _meta: { source: "figma" },
+        custom: "value",
+      },
+    });
+
+    expect(computeMcpResultCacheKey(
+      "file-key-1",
+      "figma-desktop",
+      "get_design_context",
+      { options: { a: 1, b: 2 }, nodeId: "1:2" },
+    )).toBe(computeMcpResultCacheKey(
+      "file-key-1",
+      "figma-desktop",
+      "get_design_context",
+      { nodeId: "1:2", options: { b: 2, a: 1 } },
+    ));
+
+    const cached = await readMcpResultCache({
+      settings,
+      namespace: "file-key-1",
+      serverName: "figma-desktop",
+      toolName: "get_design_context",
+      arguments: { options: { a: 1, b: 2 }, nodeId: "1:2" },
+      maxAgeSeconds: 3600,
+    });
+    expect(cached.hit).toBe(true);
+    if (!cached.hit) return;
+    expect(cached.result).toMatchObject({
+      content: [
+        { type: "text", text: "cached design" },
+        { type: "image", data: image.toString("base64"), mimeType: "image/png" },
+      ],
+      isError: false,
+      structuredContent: { ok: true },
+      _meta: { source: "figma" },
+      custom: "value",
+    });
+  });
+
+  it("rejects symlinked cache pointers that escape the archive root", async () => {
+    const root = await makeTempRoot();
+    const archive = join(root, "archive");
+    const settings = { resultArchive: { directory: archive } };
+    const request = {
+      settings,
+      serverName: "figma-desktop",
+      toolName: "get_metadata",
+      namespace: "file-key-1",
+      arguments: { nodeId: "1:2" },
+      origin: "proxy" as const,
+      result: { content: [{ type: "text", text: "metadata" }], isError: false },
+    };
+    await archiveMcpToolResult(request);
+    const pointer = (await collectFiles(join(archive, "cache")))[0]!;
+    const external = join(root, "external-pointer.json");
+    await rename(pointer, external);
+    await symlink(external, pointer);
+
+    const cached = await readMcpResultCache({
+      settings,
+      namespace: request.namespace,
+      serverName: request.serverName,
+      toolName: request.toolName,
+      arguments: request.arguments,
+      maxAgeSeconds: 3600,
+    });
+    expect(cached).toMatchObject({ hit: false, reason: "invalid" });
+  });
+
+  it("does not publish MCP error results as cache hits", async () => {
+    const root = await makeTempRoot();
+    const archive = join(root, "archive");
+    const settings = { resultArchive: { directory: archive } };
+    await archiveMcpToolResult({
+      settings,
+      serverName: "figma-desktop",
+      toolName: "get_metadata",
+      namespace: "file-key-1",
+      arguments: { nodeId: "1:2" },
+      origin: "proxy",
+      result: { content: [{ type: "text", text: "denied" }], isError: true },
+    });
+    const cached = await readMcpResultCache({
+      settings,
+      namespace: "file-key-1",
+      serverName: "figma-desktop",
+      toolName: "get_metadata",
+      arguments: { nodeId: "1:2" },
+      maxAgeSeconds: 3600,
+    });
+    expect(cached).toMatchObject({ hit: false, reason: "miss" });
   });
 
   it("omits oversized arguments while retaining their hash and byte count", async () => {

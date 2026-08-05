@@ -18,6 +18,7 @@ import { toolErrorOverride } from "./error-signal.ts";
 import { createMcpRuntimeOwner, createOwnedUi, isAbortError, type McpRuntimeOwner } from "./runtime-owner.ts";
 import { publishMcpStatusShutdown } from "./mcp-status.ts";
 import { runMcpScript } from "./mcp-code.ts";
+import { createMcpCacheExecutor, type McpCacheParams } from "./mcp-cache.ts";
 
 export type { McpAdapterOptions } from "./types.ts";
 export {
@@ -618,6 +619,33 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       }
     },
   });
+
+  const earlyResultCache = earlyConfig.settings?.resultCache;
+  const resultCacheEnabled = earlyResultCache === true
+    || (typeof earlyResultCache === "object" && earlyResultCache !== null && earlyResultCache.enabled !== false);
+  if (resultCacheEnabled) {
+    (pi.registerTool as (tool: unknown) => unknown)({
+      name: "mcpCache",
+      label: "MCP Cache",
+      description: "Explicit namespace-based read-through cache for approved MCP read tools. Use a stable namespace such as a Figma file key. prefer-cache avoids a live call on a valid hit; cache-only never calls the server; refresh forces a live call and updates the archive.",
+      promptSnippet: "Read approved MCP tools through a namespace and TTL-aware cache",
+      parameters: Type.Object({
+        server: Type.String({ description: "Configured MCP server name" }),
+        tool: Type.String({ description: "Original or prefixed MCP tool name" }),
+        namespace: Type.String({ description: "Stable cache namespace, e.g. a Figma file key" }),
+        args: Type.Object({}, { additionalProperties: true, description: "MCP tool arguments" }),
+        policy: Type.Optional({
+          type: "string",
+          enum: ["prefer-cache", "cache-only", "refresh"],
+          description: "Cache policy (default: prefer-cache)",
+        } as any),
+        maxAgeSeconds: Type.Optional({ type: "number", minimum: 0 } as any),
+      }),
+      async execute(toolCallId: string, params: McpCacheParams, signal: AbortSignal | undefined) {
+        return createMcpCacheExecutor(() => state, () => initPromise)(toolCallId, params, signal);
+      },
+    });
+  }
 
   if (earlyConfig.settings?.scriptMode !== false) {
     (pi.registerTool as (tool: unknown) => unknown)({

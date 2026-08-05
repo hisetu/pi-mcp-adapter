@@ -751,6 +751,7 @@ export async function executeCall(
   getPiTools?: () => ToolInfo[],
   signal?: AbortSignal,
   origin?: "proxy" | "script",
+  archiveNamespace?: string,
 ): Promise<ProxyToolResult> {
   const ownedSignal = combineAbortSignals(state.owner?.signal, signal);
   throwIfAborted(ownedSignal);
@@ -1150,6 +1151,7 @@ export async function executeCall(
       toolName: toolMeta.originalName,
       arguments: args ?? {},
       origin: origin ?? "proxy",
+      ...(archiveNamespace ? { namespace: archiveNamespace } : {}),
       result,
     });
 

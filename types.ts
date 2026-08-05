@@ -442,6 +442,17 @@ export interface McpTraceSettings {
   maxEvents?: number;
 }
 
+export interface McpReadCacheSettings {
+  /** Enable the explicit mcpCache read-through tool. */
+  enabled?: boolean;
+  /** Exact server/original-tool allowlist entries, for example figma-desktop/get_design_context. */
+  allowTools?: string[];
+  /** Default cache TTL used when mcpCache omits maxAgeSeconds. Defaults to 3600. */
+  defaultMaxAgeSeconds?: number;
+  /** Require args.nodeId to prevent caching dynamic current-selection calls. Defaults to true. */
+  requireNodeId?: boolean;
+}
+
 export interface McpResultArchiveSettings {
   /** Enable raw result archiving. Object form defaults to enabled unless this is false. */
   enabled?: boolean;
@@ -511,6 +522,8 @@ export interface McpSettings {
    * Env overrides: MCP_RESULT_ARCHIVE and MCP_RESULT_ARCHIVE_DIR.
    */
   resultArchive?: boolean | McpResultArchiveSettings;
+  /** Explicit namespace-based read-through cache. Disabled by default. */
+  resultCache?: boolean | McpReadCacheSettings;
   /**
    * Opt-in metadata-only MCP protocol tracing. Payloads, prompts, tool
    * arguments/results, authorization data, and URLs are never persisted.

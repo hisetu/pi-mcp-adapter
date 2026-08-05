@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
-import { mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { getAgentPath } from "./agent-dir.ts";
 import type { McpResultArchiveSettings, McpSettings, ServerEntry } from "./types.ts";
 
@@ -34,6 +34,20 @@ export interface McpResultArchiveReceipt {
   omitted: boolean;
 }
 
+export type McpResultCacheLookup =
+  | { hit: true; cacheKey: string; entryPath: string; ageMs: number; result: Record<string, unknown> }
+  | { hit: false; cacheKey: string; reason: "archive-disabled" | "miss" | "expired" | "invalid" };
+
+export interface ReadMcpResultCacheInput {
+  settings?: McpSettings | undefined;
+  definition?: ServerEntry | undefined;
+  namespace: string;
+  serverName: string;
+  toolName: string;
+  arguments: Record<string, unknown>;
+  maxAgeSeconds: number;
+}
+
 export interface ArchiveMcpToolResultInput {
   settings?: McpSettings | undefined;
   definition?: ServerEntry | undefined;
@@ -41,10 +55,21 @@ export interface ArchiveMcpToolResultInput {
   toolName: string;
   arguments: Record<string, unknown>;
   origin: McpResultArchiveOrigin;
+  namespace?: string | undefined;
   result: unknown;
 }
 
 type Recordish = Record<string, unknown>;
+
+type ArchivePointer = {
+  version: number;
+  cacheKey: string;
+  timestamp: string;
+  namespace: string;
+  server: string;
+  tool: string;
+  entryPath: string;
+};
 
 const warnedArchiveErrors = new Set<string>();
 
@@ -73,6 +98,66 @@ export function resolveMcpResultArchiveOptions(
   };
 }
 
+export function computeMcpResultCacheKey(
+  namespace: string,
+  serverName: string,
+  toolName: string,
+  argumentsValue: Record<string, unknown>,
+): string {
+  return sha256(Buffer.from(canonicalJson({
+    namespace,
+    server: serverName,
+    tool: toolName,
+    arguments: argumentsValue,
+  }), "utf8"));
+}
+
+export async function readMcpResultCache(
+  input: ReadMcpResultCacheInput,
+): Promise<McpResultCacheLookup> {
+  const options = resolveMcpResultArchiveOptions(input.settings, input.definition, input.serverName);
+  const cacheKey = computeMcpResultCacheKey(input.namespace, input.serverName, input.toolName, input.arguments);
+  if (!options.enabled) return { hit: false, cacheKey, reason: "archive-disabled" };
+
+  try {
+    const pointerPath = cachePointerPath(options.directory, cacheKey);
+    const pointer = JSON.parse((await readPrivateArchiveFile(options.directory, pointerPath)).toString("utf8")) as ArchivePointer;
+    if (
+      pointer.version !== MCP_RESULT_ARCHIVE_SCHEMA_VERSION
+      || pointer.cacheKey !== cacheKey
+      || pointer.namespace !== input.namespace
+      || pointer.server !== input.serverName
+      || pointer.tool !== input.toolName
+    ) return { hit: false, cacheKey, reason: "invalid" };
+    const ageMs = Date.now() - Date.parse(pointer.timestamp);
+    if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > input.maxAgeSeconds * 1000) {
+      return { hit: false, cacheKey, reason: "expired" };
+    }
+    const entryPath = resolve(options.directory, pointer.entryPath);
+    if (!isWithinDirectory(options.directory, entryPath)) return { hit: false, cacheKey, reason: "invalid" };
+    const entry = JSON.parse((await readPrivateArchiveFile(options.directory, entryPath)).toString("utf8")) as Recordish;
+    if (
+      entry.version !== MCP_RESULT_ARCHIVE_SCHEMA_VERSION
+      || entry.cacheKey !== cacheKey
+      || entry.namespace !== input.namespace
+      || entry.server !== input.serverName
+      || entry.tool !== input.toolName
+      || entry.timestamp !== pointer.timestamp
+    ) return { hit: false, cacheKey, reason: "invalid" };
+    const request = asRecord(entry.request);
+    const archivedArguments = await readArchivedJson(options.directory, request?.arguments);
+    if (canonicalJson(archivedArguments) !== canonicalJson(input.arguments)) {
+      return { hit: false, cacheKey, reason: "invalid" };
+    }
+    const result = await reconstructArchivedResult(options.directory, asRecord(entry.result));
+    if (!result || result.isError === true) return { hit: false, cacheKey, reason: "invalid" };
+    return { hit: true, cacheKey, entryPath, ageMs, result };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { hit: false, cacheKey, reason: "miss" };
+    return { hit: false, cacheKey, reason: "invalid" };
+  }
+}
+
 export async function archiveMcpToolResult(
   input: ArchiveMcpToolResultInput,
 ): Promise<McpResultArchiveReceipt | undefined> {
@@ -96,6 +181,10 @@ export async function archiveMcpToolResult(
   const timestamp = new Date().toISOString();
   const resultRecord = asRecord(input.result);
   const oversized = rawBytes > options.maxBytes;
+  const namespace = input.namespace?.trim() || undefined;
+  const cacheKey = namespace
+    ? computeMcpResultCacheKey(namespace, input.serverName, input.toolName, input.arguments)
+    : undefined;
 
   await ensurePrivateDirectory(options.directory);
 
@@ -122,6 +211,7 @@ export async function archiveMcpToolResult(
     server: input.serverName,
     tool: input.toolName,
     origin: input.origin,
+    ...(namespace ? { namespace, cacheKey } : {}),
     request: {
       argumentsSha256,
       argumentsBytes,
@@ -143,6 +233,17 @@ export async function archiveMcpToolResult(
   };
 
   const entryPath = await writeEntry(options.directory, input.serverName, timestamp, entry);
+  if (cacheKey && namespace && argumentsObject && !oversized && resultRecord?.isError !== true) {
+    await writeCachePointer(options.directory, cacheKey, {
+      version: MCP_RESULT_ARCHIVE_SCHEMA_VERSION,
+      cacheKey,
+      timestamp,
+      namespace,
+      server: input.serverName,
+      tool: input.toolName,
+      entryPath: relative(options.directory, entryPath),
+    });
+  }
   return { entryPath, rawSha256, rawBytes, omitted: oversized };
 }
 
@@ -249,6 +350,82 @@ async function writeObject(
   };
 }
 
+async function writeCachePointer(root: string, cacheKey: string, pointer: ArchivePointer): Promise<void> {
+  const destination = cachePointerPath(root, cacheKey);
+  const directory = resolve(root, "cache", cacheKey.slice(0, 2));
+  await ensurePrivateDirectory(directory);
+  await writeJsonAtomic(destination, pointer);
+}
+
+function cachePointerPath(root: string, cacheKey: string): string {
+  return resolve(root, "cache", cacheKey.slice(0, 2), `${cacheKey}.json`);
+}
+
+async function reconstructArchivedResult(
+  root: string,
+  archived: Recordish | undefined,
+): Promise<Record<string, unknown> | undefined> {
+  if (!archived || archived.status !== "archived" || !Array.isArray(archived.content)) return undefined;
+  const content: unknown[] = [];
+  for (const blockValue of archived.content) {
+    const block = asRecord(blockValue);
+    const object = asRecord(block?.object);
+    if (!block || !object || typeof block.type !== "string") return undefined;
+    const metadata = asRecord(block.metadata) ?? {};
+    const bytes = await readArchivedObject(root, object);
+    if (block.type === "text") content.push({ ...metadata, type: "text", text: bytes.toString("utf8") });
+    else if (block.type === "image") content.push({ ...metadata, type: "image", data: bytes.toString("base64") });
+    else content.push(JSON.parse(bytes.toString("utf8")));
+  }
+
+  const result: Record<string, unknown> = { content, isError: archived.isError === true };
+  if (archived.structuredContent) result.structuredContent = await readArchivedJson(root, archived.structuredContent);
+  if (archived.meta) result._meta = await readArchivedJson(root, archived.meta);
+  if (archived.extra) Object.assign(result, await readArchivedJson(root, archived.extra));
+  return result;
+}
+
+async function readArchivedJson(root: string, reference: unknown): Promise<unknown> {
+  return JSON.parse((await readArchivedObject(root, asRecord(reference))).toString("utf8"));
+}
+
+async function readArchivedObject(root: string, reference: Recordish | undefined): Promise<Buffer> {
+  if (!reference || typeof reference.path !== "string" || typeof reference.sha256 !== "string") {
+    throw new Error("Invalid MCP archive object reference");
+  }
+  const path = resolve(root, reference.path);
+  if (!isWithinDirectory(root, path)) throw new Error("MCP archive object escaped archive root");
+  const bytes = await readPrivateArchiveFile(root, path);
+  if (sha256(bytes) !== reference.sha256) throw new Error("MCP archive object failed integrity verification");
+  return bytes;
+}
+
+async function readPrivateArchiveFile(root: string, path: string): Promise<Buffer> {
+  const info = await lstat(path);
+  if (!info.isFile() || info.isSymbolicLink()) throw new Error("MCP archive reference is not a regular file");
+  const [realRoot, realFile] = await Promise.all([realpath(root), realpath(path)]);
+  if (!isWithinDirectory(realRoot, realFile)) throw new Error("MCP archive reference escaped archive root");
+  return readFile(realFile);
+}
+
+function isWithinDirectory(root: string, path: string): boolean {
+  const relativePath = relative(resolve(root), resolve(path));
+  return relativePath !== "" && !relativePath.startsWith("..") && !isAbsolute(relativePath);
+}
+
+async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
+  const temporary = `${path}.${process.pid}-${randomBytes(6).toString("hex")}.tmp`;
+  let exists = false;
+  try {
+    await writeFile(temporary, `${stringifyJson(value, "MCP cache pointer")}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    exists = true;
+    await rename(temporary, path);
+    exists = false;
+  } finally {
+    if (exists) await unlink(temporary).catch(() => {});
+  }
+}
+
 async function writeEntry(
   root: string,
   serverName: string,
@@ -324,6 +501,16 @@ function resolveArchiveDirectory(configured: string | undefined): string {
       ? join(homedir(), configured.slice(2))
       : configured;
   return isAbsolute(expanded) ? resolve(expanded) : resolve(process.cwd(), expanded);
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value as Recordish).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson((value as Recordish)[key])}`).join(",")}}`;
+  }
+  const serialized = JSON.stringify(value);
+  if (serialized === undefined) throw new Error("MCP cache key value is not JSON-serializable");
+  return serialized;
 }
 
 function stringifyJson(value: unknown, label: string): string {

@@ -93,6 +93,7 @@
     "tool-result-renderer.ts",
     "mcp-output-guard.ts",
     "mcp-result-archive.ts",
+    "mcp-cache.ts",
     "mcp-code.ts",
     "mcp-script-worker.mjs",
     "mcp-probe.ts",
