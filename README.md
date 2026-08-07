@@ -444,6 +444,54 @@ mcpCache({
 
 `prefer-cache` returns a valid hit without contacting the MCP server, `cache-only` never makes a live call, and `refresh` always calls the server and updates the pointer. Only exact `server/original-tool` entries in `allowTools` can run. The bundled `figma-mcp-cache` skill teaches newly started agents to extract the Figma file/branch key as namespace, prefer `mcpCache` over direct Figma reads, and stop direct retries after rate limiting. With `requireNodeId` enabled (the default), dynamic current-selection requests are rejected. MCP error results and oversized archived results are never published as hits.
 
+#### Read-through call chain
+
+```text
+Agent
+  └─ mcpCache(server, tool, namespace, args, policy, maxAgeSeconds)
+       ├─ validate resultCache enabled
+       ├─ validate namespace + explicit nodeId
+       ├─ resolve original MCP tool
+       ├─ enforce exact allowTools entry
+       ├─ enforce server enabled state + approval policy
+       ├─ verify backing resultArchive is enabled
+       └─ branch by policy
+            ├─ prefer-cache
+            │    ├─ compute SHA-256(namespace + server + tool + canonical args)
+            │    ├─ read cache pointer → archive entry → content-addressed objects
+            │    ├─ validate TTL, namespace, request identity, paths, and hashes
+            │    ├─ hit → reconstruct raw CallToolResult → outputGuard → Agent
+            │    └─ miss/expired → live executeCall
+            ├─ cache-only
+            │    ├─ perform the same validated cache lookup
+            │    ├─ hit → reconstruct raw CallToolResult → outputGuard → Agent
+            │    └─ miss/expired → return cache_miss; never contact MCP server
+            └─ refresh
+                 └─ skip lookup → live executeCall
+
+live executeCall
+  └─ MCP client.callTool
+       ├─ raw CallToolResult
+       ├─ result archive (before outputGuard)
+       │    ├─ arguments/content → SHA-256 objects
+       │    ├─ append invocation entry
+       │    └─ successful namespaced result → atomically replace cache pointer
+       ├─ outputGuard / model-facing truncation
+       └─ Agent (cache=miss or cache=refresh)
+```
+
+| Stage | Cache hit | Cache miss / `refresh` | Direct `figma_*` call |
+|---|---|---|---|
+| Namespace required | Yes | Yes | No |
+| Approval and server-disabled checks | Yes | Yes | Yes |
+| Contacts MCP server | No | Yes | Yes |
+| Archives raw result before truncation | No new entry | Yes | Yes |
+| Publishes reusable cache pointer | Already exists | Yes, only for successful namespaced results | No, because direct calls have no namespace |
+| Applies `outputGuard` before model delivery | Yes | Yes | Yes |
+| MCP error becomes a cache hit | Never | Never | Never |
+
+Calling `figma_desktop_get_design_context` directly bypasses the read-through lookup. Its raw response can still be archived, but without a namespace it does not create a reusable pointer. Agents must enter through `mcpCache` to save a future MCP call.
+
 #### Cache policy and freshness
 
 | Use case | Policy | Contacts MCP server | May return older data | Suggested age window | Proves current design state |
