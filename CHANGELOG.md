@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Added an opt-in raw MCP result archive that captures proxy, direct, and `mcpScript` `callTool` results before output guarding, with private content-addressed storage, per-server controls, and payload size limits.
-- Added the explicit `mcpCache` read-through tool with stable namespaces, exact tool allowlists, TTLs, and `prefer-cache`, `cache-only`, and `refresh` policies.
+- Added the explicit `mcpCache` read-through tool with stable namespaces, exact tool allowlists, TTLs, and `prefer-cache`, `cache-only`, and `refresh` policies, plus a bundled Figma cache skill that steers new agents away from repeated direct reads.
 
 ## [2.20.1] - 2026-08-04
 

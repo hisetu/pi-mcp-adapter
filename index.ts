@@ -627,7 +627,7 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
     (pi.registerTool as (tool: unknown) => unknown)({
       name: "mcpCache",
       label: "MCP Cache",
-      description: "Explicit namespace-based read-through cache for approved MCP read tools. Use a stable namespace such as a Figma file key. prefer-cache avoids a live call on a valid hit; cache-only never calls the server; refresh forces a live call and updates the archive.",
+      description: "Explicit namespace-based read-through cache for approved MCP read tools. For Figma URL reads, prefer this tool over direct figma/figma-desktop read tools: extract the file key (or branch key) as namespace and the node-id as args.nodeId. prefer-cache avoids a live call on a valid hit; cache-only never calls the server and is required after rate limiting; refresh forces a live call and updates the archive.",
       promptSnippet: "Read approved MCP tools through a namespace and TTL-aware cache",
       parameters: Type.Object({
         server: Type.String({ description: "Configured MCP server name" }),

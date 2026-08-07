@@ -442,7 +442,7 @@ mcpCache({
 })
 ```
 
-`prefer-cache` returns a valid hit without contacting the MCP server, `cache-only` never makes a live call, and `refresh` always calls the server and updates the pointer. Only exact `server/original-tool` entries in `allowTools` can run. With `requireNodeId` enabled (the default), dynamic current-selection requests are rejected. MCP error results and oversized archived results are never published as hits.
+`prefer-cache` returns a valid hit without contacting the MCP server, `cache-only` never makes a live call, and `refresh` always calls the server and updates the pointer. Only exact `server/original-tool` entries in `allowTools` can run. The bundled `figma-mcp-cache` skill teaches newly started agents to extract the Figma file/branch key as namespace, prefer `mcpCache` over direct Figma reads, and stop direct retries after rate limiting. With `requireNodeId` enabled (the default), dynamic current-selection requests are rejected. MCP error results and oversized archived results are never published as hits.
 
 ### MCP Scripting
 
