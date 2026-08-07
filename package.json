@@ -121,6 +121,7 @@
     "app-bridge.bundle.js",
     "banner.png",
     "skills",
+    "docs",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"
