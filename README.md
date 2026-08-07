@@ -287,7 +287,8 @@ When any enabled server uses `eager` or `keep-alive`, initialization also starts
       "enabled": true,
       "allowTools": ["figma-desktop/get_design_context"],
       "defaultMaxAgeSeconds": 3600,
-      "requireNodeId": true
+      "requireNodeId": true,
+      "liveTimeoutMs": 60000
     },
     "trace": {
       "enabled": true,
@@ -321,7 +322,7 @@ When any enabled server uses `eager` or `keep-alive`, initialization also starts
 | `elicitation` | Allow MCP servers to request user input through Pi dialogs (default: true when Pi UI is available). |
 | `outputGuard` | Guard oversized MCP output: `true` (default), `false`, or `{ maxBytes, maxLines, detailsMaxBytes }`. See [Output Guard](#output-guard). |
 | `resultArchive` | Opt-in raw MCP tool result archive: `true`, `false`, or `{ enabled, directory, servers, maxBytes, maxArgumentBytes }`. Disabled by default. See [Raw Result Archive](#raw-result-archive). |
-| `resultCache` | Explicit namespace-based read-through cache used by `mcpCache`: `true`, `false`, or `{ enabled, allowTools, defaultMaxAgeSeconds, requireNodeId }`. Disabled by default. |
+| `resultCache` | Explicit namespace-based read-through cache used by `mcpCache`: `true`, `false`, or `{ enabled, allowTools, defaultMaxAgeSeconds, requireNodeId, liveTimeoutMs }`. Disabled by default. |
 | `trace` | Opt-in metadata-only protocol tracing. Set `{ enabled: true }` globally or `trace: true` on a server. The per-session JSONL file defaults to `.pi/mcp-traces/`; `file`, `maxBytes` (default 262144), and `maxEvents` (default 10000) can be set. Raw MCP payloads, prompts, tool arguments/results, auth data, and URLs are never persisted. |
 
 Per-server `idleTimeout`, `requestTimeoutMs`, and `approveTools` override the global settings. `debug` remains stderr display and is unrelated to protocol tracing.

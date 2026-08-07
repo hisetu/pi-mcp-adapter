@@ -1,4 +1,9 @@
 import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
+import { abortable } from "./abort.ts";
+import {
+  computeMcpResultCacheKeyV2,
+  normalizeMcpCacheArguments,
+} from "./mcp-cache-key.ts";
 import { guardMcpOutput, guardedMcpDetails, resolveMcpOutputGuardOptions } from "./mcp-output-guard.ts";
 import { readMcpResultCache, resolveMcpResultArchiveOptions } from "./mcp-result-archive.ts";
 import { executeCall } from "./proxy-modes.ts";
@@ -26,6 +31,17 @@ type McpCacheExecute = (
 ) => Promise<AgentToolResult<Record<string, unknown>>>;
 
 const DEFAULT_MAX_AGE_SECONDS = 3600;
+const DEFAULT_LIVE_TIMEOUT_MS = 60_000;
+
+type SharedLiveCall = {
+  promise: Promise<AgentToolResult<Record<string, unknown>>>;
+  controller: AbortController;
+  waiters: number;
+  settled: boolean;
+  timer: ReturnType<typeof setTimeout>;
+};
+
+const liveCallsByState = new WeakMap<McpExtensionState, Map<string, SharedLiveCall>>();
 
 export function createMcpCacheExecutor(
   getState: () => McpExtensionState | null,
@@ -53,7 +69,13 @@ export function createMcpCacheExecutor(
     if (!params.args || typeof params.args !== "object" || Array.isArray(params.args)) {
       return cacheError("invalid_args", "args must be a JSON object.");
     }
-    if (configured.requireNodeId && (typeof params.args.nodeId !== "string" || !params.args.nodeId.trim())) {
+    let normalizedArgs: Record<string, unknown>;
+    try {
+      normalizedArgs = normalizeMcpCacheArguments(params.args);
+    } catch (error) {
+      return cacheError("invalid_args", error instanceof Error ? error.message : String(error));
+    }
+    if (configured.requireNodeId && (typeof normalizedArgs.nodeId !== "string" || !normalizedArgs.nodeId.trim())) {
       return cacheError("node_id_required", "args.nodeId is required; dynamic current-selection calls are not cache-safe.");
     }
 
@@ -71,7 +93,7 @@ export function createMcpCacheExecutor(
       state,
       params.server,
       metadata,
-      params.args,
+      normalizedArgs,
       signal,
       "proxy",
     );
@@ -131,15 +153,27 @@ export function createMcpCacheExecutor(
       }
     }
 
-    const live = await executeCall(
-      state,
-      metadata.name,
-      params.args,
-      params.server,
-      undefined,
-      signal,
-      "proxy",
+    const cacheKey = computeMcpResultCacheKeyV2({
       namespace,
+      serverName: params.server,
+      toolName: metadata.originalName,
+      arguments: normalizedArgs,
+    });
+    const live = await runLiveSingleflight(
+      state,
+      cacheKey,
+      (sharedSignal) => executeCall(
+        state!,
+        metadata.name,
+        normalizedArgs,
+        params.server,
+        undefined,
+        sharedSignal,
+        "proxy",
+        namespace,
+      ),
+      signal,
+      configured.liveTimeoutMs,
     );
     return {
       content: live.content,
@@ -152,6 +186,53 @@ export function createMcpCacheExecutor(
   };
 }
 
+async function runLiveSingleflight(
+  state: McpExtensionState,
+  cacheKey: string,
+  factory: (signal: AbortSignal) => Promise<AgentToolResult<Record<string, unknown>>>,
+  signal: AbortSignal | undefined,
+  timeoutMs: number,
+): Promise<AgentToolResult<Record<string, unknown>>> {
+  let calls = liveCallsByState.get(state);
+  if (!calls) {
+    calls = new Map();
+    liveCallsByState.set(state, calls);
+  }
+
+  let shared = calls.get(cacheKey);
+  if (!shared) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      controller.abort(new Error(`MCP cache shared live call timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    timer.unref?.();
+    shared = {
+      promise: factory(controller.signal),
+      controller,
+      waiters: 0,
+      settled: false,
+      timer,
+    };
+    calls.set(cacheKey, shared);
+    const current = shared;
+    void current.promise.finally(() => {
+      current.settled = true;
+      clearTimeout(current.timer);
+      if (calls?.get(cacheKey) === current) calls.delete(cacheKey);
+    }).catch(() => {});
+  }
+
+  shared.waiters += 1;
+  try {
+    return await (signal ? abortable(shared.promise, signal) : shared.promise);
+  } finally {
+    shared.waiters -= 1;
+    if (shared.waiters === 0 && !shared.settled) {
+      shared.controller.abort(new Error("All MCP cache singleflight waiters cancelled"));
+    }
+  }
+}
+
 function resolveReadCacheSettings(value: boolean | McpReadCacheSettings | undefined): Required<McpReadCacheSettings> {
   const settings = typeof value === "object" && value !== null ? value : {};
   return {
@@ -159,6 +240,7 @@ function resolveReadCacheSettings(value: boolean | McpReadCacheSettings | undefi
     allowTools: Array.isArray(settings.allowTools) ? settings.allowTools.filter((item): item is string => typeof item === "string") : [],
     defaultMaxAgeSeconds: positiveNumber(settings.defaultMaxAgeSeconds) ?? DEFAULT_MAX_AGE_SECONDS,
     requireNodeId: settings.requireNodeId !== false,
+    liveTimeoutMs: positiveNumber(settings.liveTimeoutMs) ?? DEFAULT_LIVE_TIMEOUT_MS,
   };
 }
 

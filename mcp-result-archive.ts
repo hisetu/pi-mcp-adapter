@@ -1,8 +1,15 @@
 import { createHash, randomBytes } from "node:crypto";
-import { lstat, mkdir, open, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, open, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { getAgentPath } from "./agent-dir.ts";
+import {
+  canonicalizeMcpArguments,
+  computeMcpResultCacheKeyV1,
+  computeMcpResultCacheKeyV2,
+  MCP_CACHE_KEY_VERSION,
+  normalizeMcpCacheArguments,
+} from "./mcp-cache-key.ts";
 import type { McpResultArchiveSettings, McpSettings, ServerEntry } from "./types.ts";
 
 export const MCP_RESULT_ARCHIVE_SCHEMA_VERSION = 1;
@@ -35,7 +42,7 @@ export interface McpResultArchiveReceipt {
 }
 
 export type McpResultCacheLookup =
-  | { hit: true; cacheKey: string; entryPath: string; ageMs: number; result: Record<string, unknown> }
+  | { hit: true; cacheKey: string; entryPath: string; capturedAt: string; ageMs: number; result: Record<string, unknown> }
   | { hit: false; cacheKey: string; reason: "archive-disabled" | "miss" | "expired" | "invalid" };
 
 export interface ReadMcpResultCacheInput {
@@ -64,6 +71,8 @@ type Recordish = Record<string, unknown>;
 type ArchivePointer = {
   version: number;
   cacheKey: string;
+  cacheKeyVersion?: number;
+  entryCacheKey?: string;
   timestamp: string;
   namespace: string;
   server: string;
@@ -104,27 +113,98 @@ export function computeMcpResultCacheKey(
   toolName: string,
   argumentsValue: Record<string, unknown>,
 ): string {
-  return sha256(Buffer.from(canonicalJson({
-    namespace,
-    server: serverName,
-    tool: toolName,
-    arguments: argumentsValue,
-  }), "utf8"));
+  return computeMcpResultCacheKeyV2({ namespace, serverName, toolName, arguments: argumentsValue });
 }
 
 export async function readMcpResultCache(
   input: ReadMcpResultCacheInput,
 ): Promise<McpResultCacheLookup> {
   const options = resolveMcpResultArchiveOptions(input.settings, input.definition, input.serverName);
-  const cacheKey = computeMcpResultCacheKey(input.namespace, input.serverName, input.toolName, input.arguments);
+  const identity = {
+    namespace: input.namespace,
+    serverName: input.serverName,
+    toolName: input.toolName,
+    arguments: input.arguments,
+  };
+  const cacheKey = computeMcpResultCacheKeyV2(identity);
   if (!options.enabled) return { hit: false, cacheKey, reason: "archive-disabled" };
 
+  const v2 = await readCacheKey(options.directory, input, cacheKey, MCP_CACHE_KEY_VERSION);
+  if (v2.hit || v2.reason !== "miss") return v2;
+
+  let legacyHit: Extract<McpResultCacheLookup, { hit: true }> | undefined;
+  let legacyKey: string | undefined;
+  let legacyCandidates: string[];
   try {
-    const pointerPath = cachePointerPath(options.directory, cacheKey);
-    const pointer = JSON.parse((await readPrivateArchiveFile(options.directory, pointerPath)).toString("utf8")) as ArchivePointer;
+    legacyCandidates = legacyCacheKeys(identity);
+  } catch {
+    return v2;
+  }
+  for (const candidate of legacyCandidates) {
+    if (candidate === cacheKey) continue;
+    const legacy = await readCacheKey(options.directory, input, candidate, 1);
+    if (legacy.hit) {
+      legacyHit = legacy;
+      legacyKey = candidate;
+      break;
+    }
+    if (legacy.reason !== "miss") return { ...legacy, cacheKey };
+  }
+  if (!legacyHit || !legacyKey) return v2;
+
+  const concurrentV2 = await readCacheKey(options.directory, input, cacheKey, MCP_CACHE_KEY_VERSION);
+  if (concurrentV2.hit || concurrentV2.reason !== "miss") return concurrentV2;
+
+  const migrated = await writeCachePointerIfAbsent(options.directory, cacheKey, {
+    version: MCP_RESULT_ARCHIVE_SCHEMA_VERSION,
+    cacheKey,
+    cacheKeyVersion: MCP_CACHE_KEY_VERSION,
+    entryCacheKey: legacyKey,
+    timestamp: legacyHit.capturedAt,
+    namespace: input.namespace,
+    server: input.serverName,
+    tool: input.toolName,
+    entryPath: relative(options.directory, legacyHit.entryPath),
+  });
+  if (!migrated) {
+    const winner = await readCacheKey(options.directory, input, cacheKey, MCP_CACHE_KEY_VERSION);
+    if (winner.hit || winner.reason !== "miss") return winner;
+  }
+  return { ...legacyHit, cacheKey };
+}
+
+function legacyCacheKeys(identity: {
+  namespace: string;
+  serverName: string;
+  toolName: string;
+  arguments: Record<string, unknown>;
+}): string[] {
+  const argumentCandidates: Record<string, unknown>[] = [identity.arguments];
+  const normalized = normalizeMcpCacheArguments(identity.arguments);
+  argumentCandidates.push(normalized);
+  if (typeof normalized.nodeId === "string" && /^(\d+):(\d+)$/.test(normalized.nodeId)) {
+    argumentCandidates.push({ ...normalized, nodeId: normalized.nodeId.replace(":", "-") });
+  }
+  return [...new Set(argumentCandidates.map((argumentsValue) => computeMcpResultCacheKeyV1({
+    ...identity,
+    arguments: argumentsValue,
+  })))];
+}
+
+async function readCacheKey(
+  root: string,
+  input: ReadMcpResultCacheInput,
+  cacheKey: string,
+  expectedKeyVersion: number,
+): Promise<McpResultCacheLookup> {
+  try {
+    const pointerPath = cachePointerPath(root, cacheKey);
+    const pointer = JSON.parse((await readPrivateArchiveFile(root, pointerPath)).toString("utf8")) as ArchivePointer;
+    const pointerKeyVersion = pointer.cacheKeyVersion ?? 1;
     if (
       pointer.version !== MCP_RESULT_ARCHIVE_SCHEMA_VERSION
       || pointer.cacheKey !== cacheKey
+      || pointerKeyVersion !== expectedKeyVersion
       || pointer.namespace !== input.namespace
       || pointer.server !== input.serverName
       || pointer.tool !== input.toolName
@@ -133,25 +213,27 @@ export async function readMcpResultCache(
     if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > input.maxAgeSeconds * 1000) {
       return { hit: false, cacheKey, reason: "expired" };
     }
-    const entryPath = resolve(options.directory, pointer.entryPath);
-    if (!isWithinDirectory(options.directory, entryPath)) return { hit: false, cacheKey, reason: "invalid" };
-    const entry = JSON.parse((await readPrivateArchiveFile(options.directory, entryPath)).toString("utf8")) as Recordish;
+    const entryPath = resolve(root, pointer.entryPath);
+    if (!isWithinDirectory(root, entryPath)) return { hit: false, cacheKey, reason: "invalid" };
+    const entry = JSON.parse((await readPrivateArchiveFile(root, entryPath)).toString("utf8")) as Recordish;
+    const expectedEntryKey = pointer.entryCacheKey ?? cacheKey;
     if (
       entry.version !== MCP_RESULT_ARCHIVE_SCHEMA_VERSION
-      || entry.cacheKey !== cacheKey
+      || entry.cacheKey !== expectedEntryKey
       || entry.namespace !== input.namespace
       || entry.server !== input.serverName
       || entry.tool !== input.toolName
       || entry.timestamp !== pointer.timestamp
     ) return { hit: false, cacheKey, reason: "invalid" };
     const request = asRecord(entry.request);
-    const archivedArguments = await readArchivedJson(options.directory, request?.arguments);
-    if (canonicalJson(archivedArguments) !== canonicalJson(input.arguments)) {
-      return { hit: false, cacheKey, reason: "invalid" };
-    }
-    const result = await reconstructArchivedResult(options.directory, asRecord(entry.result));
+    const archivedArguments = await readArchivedJson(root, request?.arguments);
+    if (
+      !asRecord(archivedArguments)
+      || canonicalizeMcpArguments(archivedArguments as Record<string, unknown>) !== canonicalizeMcpArguments(input.arguments)
+    ) return { hit: false, cacheKey, reason: "invalid" };
+    const result = await reconstructArchivedResult(root, asRecord(entry.result));
     if (!result || result.isError === true) return { hit: false, cacheKey, reason: "invalid" };
-    return { hit: true, cacheKey, entryPath, ageMs, result };
+    return { hit: true, cacheKey, entryPath, capturedAt: pointer.timestamp, ageMs, result };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return { hit: false, cacheKey, reason: "miss" };
     return { hit: false, cacheKey, reason: "invalid" };
@@ -211,7 +293,7 @@ export async function archiveMcpToolResult(
     server: input.serverName,
     tool: input.toolName,
     origin: input.origin,
-    ...(namespace ? { namespace, cacheKey } : {}),
+    ...(namespace ? { namespace, cacheKey, cacheKeyVersion: MCP_CACHE_KEY_VERSION } : {}),
     request: {
       argumentsSha256,
       argumentsBytes,
@@ -237,6 +319,8 @@ export async function archiveMcpToolResult(
     await writeCachePointer(options.directory, cacheKey, {
       version: MCP_RESULT_ARCHIVE_SCHEMA_VERSION,
       cacheKey,
+      cacheKeyVersion: MCP_CACHE_KEY_VERSION,
+      entryCacheKey: cacheKey,
       timestamp,
       namespace,
       server: input.serverName,
@@ -355,6 +439,33 @@ async function writeCachePointer(root: string, cacheKey: string, pointer: Archiv
   const directory = resolve(root, "cache", cacheKey.slice(0, 2));
   await ensurePrivateDirectory(directory);
   await writeJsonAtomic(destination, pointer);
+}
+
+async function writeCachePointerIfAbsent(
+  root: string,
+  cacheKey: string,
+  pointer: ArchivePointer,
+): Promise<boolean> {
+  const destination = cachePointerPath(root, cacheKey);
+  const directory = resolve(root, "cache", cacheKey.slice(0, 2));
+  await ensurePrivateDirectory(directory);
+  const temporary = `${destination}.${process.pid}-${randomBytes(6).toString("hex")}.tmp`;
+  try {
+    await writeFile(temporary, `${stringifyJson(pointer, "MCP cache pointer")}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+    try {
+      await link(temporary, destination);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+      throw error;
+    }
+  } finally {
+    await unlink(temporary).catch(() => {});
+  }
 }
 
 function cachePointerPath(root: string, cacheKey: string): string {
@@ -501,16 +612,6 @@ function resolveArchiveDirectory(configured: string | undefined): string {
       ? join(homedir(), configured.slice(2))
       : configured;
   return isAbsolute(expanded) ? resolve(expanded) : resolve(process.cwd(), expanded);
-}
-
-function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  if (value && typeof value === "object") {
-    return `{${Object.keys(value as Recordish).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson((value as Recordish)[key])}`).join(",")}}`;
-  }
-  const serialized = JSON.stringify(value);
-  if (serialized === undefined) throw new Error("MCP cache key value is not JSON-serializable");
-  return serialized;
 }
 
 function stringifyJson(value: unknown, label: string): string {

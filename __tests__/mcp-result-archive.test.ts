@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -12,6 +12,7 @@ import {
   DEFAULT_MCP_RESULT_ARCHIVE_MAX_BYTES,
   resolveMcpResultArchiveOptions,
 } from "../mcp-result-archive.ts";
+import { computeMcpResultCacheKeyV1, computeMcpResultCacheKeyV2 } from "../mcp-cache-key.ts";
 
 const tempRoots: string[] = [];
 
@@ -173,6 +174,58 @@ describe("archiveMcpToolResult", () => {
       structuredContent: { ok: true },
       _meta: { source: "figma" },
       custom: "value",
+    });
+  });
+
+  it("lazily migrates a valid v1 pointer to cache key v2", async () => {
+    const root = await makeTempRoot();
+    const archive = join(root, "archive");
+    const settings = { resultArchive: { directory: archive } };
+    const identity = {
+      namespace: "legacy-file",
+      serverName: "figma-desktop",
+      toolName: "get_metadata",
+      arguments: { nodeId: "7-8" },
+    };
+    await archiveMcpToolResult({
+      settings,
+      serverName: identity.serverName,
+      toolName: identity.toolName,
+      namespace: identity.namespace,
+      arguments: identity.arguments,
+      origin: "proxy",
+      result: { content: [{ type: "text", text: "legacy metadata" }], isError: false },
+    });
+
+    const v2Key = computeMcpResultCacheKeyV2(identity);
+    const v1Key = computeMcpResultCacheKeyV1(identity);
+    const v2PointerPath = join(archive, "cache", v2Key.slice(0, 2), `${v2Key}.json`);
+    const pointer = JSON.parse(await readFile(v2PointerPath, "utf8"));
+    const entryPath = join(archive, pointer.entryPath);
+    const entry = JSON.parse(await readFile(entryPath, "utf8"));
+    entry.cacheKey = v1Key;
+    delete entry.cacheKeyVersion;
+    await writeFile(entryPath, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
+
+    const v1Directory = join(archive, "cache", v1Key.slice(0, 2));
+    await mkdir(v1Directory, { recursive: true, mode: 0o700 });
+    pointer.cacheKey = v1Key;
+    delete pointer.cacheKeyVersion;
+    delete pointer.entryCacheKey;
+    await writeFile(join(v1Directory, `${v1Key}.json`), `${JSON.stringify(pointer)}\n`, { mode: 0o600 });
+    await unlink(v2PointerPath);
+
+    const cached = await readMcpResultCache({
+      ...identity,
+      arguments: { nodeId: "7:8" },
+      settings,
+      maxAgeSeconds: 3600,
+    });
+    expect(cached).toMatchObject({ hit: true, cacheKey: v2Key });
+    expect(JSON.parse(await readFile(v2PointerPath, "utf8"))).toMatchObject({
+      cacheKey: v2Key,
+      cacheKeyVersion: 2,
+      entryCacheKey: v1Key,
     });
   });
 

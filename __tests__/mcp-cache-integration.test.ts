@@ -1,5 +1,5 @@
 import { fileURLToPath } from "node:url";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -41,6 +41,31 @@ describe("mcpCache integration", () => {
     expect(second.details).toMatchObject({ mode: "cache", cache: "hit", server: "real", tool: "draft07-valid" });
     expect(second.content).toEqual([{ type: "text", text: "draft07-valid" }]);
     expect(String(second.details.entryPath)).toContain(archive);
+  });
+
+  it("collapses concurrent misses for one cache key into a single live archive entry", async () => {
+    const { state, archive } = await createState();
+    const execute = createMcpCacheExecutor(() => state, () => null);
+    const params = {
+      server: "real",
+      tool: "draft07-valid",
+      namespace: "singleflight-file",
+      args: { nodeId: "9-9" },
+      policy: "prefer-cache" as const,
+      maxAgeSeconds: 3600,
+    };
+
+    const results = await Promise.all(
+      Array.from({ length: 20 }, (_, index) => execute(`call-${index}`, params)),
+    );
+    expect(results.every((result) => result.content[0]?.type === "text" && result.content[0].text === "draft07-valid"))
+      .toBe(true);
+    const entries = await collectFiles(join(archive, "entries"));
+    expect(entries).toHaveLength(1);
+    expect(await collectFiles(join(archive, "cache"))).toHaveLength(1);
+    const entry = JSON.parse(await readFile(entries[0]!, "utf8"));
+    const archivedArguments = JSON.parse(await readFile(join(archive, entry.request.arguments.path), "utf8"));
+    expect(archivedArguments.nodeId).toBe("9:9");
   });
 
   it("supports cache-only misses and validates namespace, node id, and allowlist", async () => {
@@ -92,6 +117,16 @@ describe("mcpCache integration", () => {
     expect(refreshed.details).toMatchObject({ cache: "refresh", namespace: "file" });
   });
 });
+
+async function collectFiles(root: string): Promise<string[]> {
+  const files: string[] = [];
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    const path = join(root, entry.name);
+    if (entry.isDirectory()) files.push(...await collectFiles(path));
+    else files.push(path);
+  }
+  return files;
+}
 
 async function createState(): Promise<{ state: McpExtensionState; archive: string }> {
   const root = await mkdtemp(join(tmpdir(), "pi-mcp-cache-integration-"));

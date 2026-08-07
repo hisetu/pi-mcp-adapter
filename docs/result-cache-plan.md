@@ -6,8 +6,8 @@
 - Explicit read-through tool: implemented as `mcpCache` behind `settings.resultCache`
 - Figma agent guidance: bundled as `figma-mcp-cache`
 - Transparent interception of direct MCP tools: intentionally not implemented
-- RFC 8785 canonicalization and Figma `nodeId` normalization: planned
-- Same-process singleflight for concurrent misses: planned
+- RFC 8785 canonicalization and Figma `nodeId` normalization: implemented as Cache Key v2 with v1 lazy migration
+- Same-process singleflight for concurrent misses: implemented
 - Retention, mark-and-sweep GC, and archive size ceiling: planned
 - Windows private ACL support: not implemented; raw archiving fails closed
 
@@ -63,7 +63,8 @@ Both features are disabled by default. Read-through caching requires the backing
         "figma-desktop/get_variable_defs"
       ],
       "defaultMaxAgeSeconds": 3600,
-      "requireNodeId": true
+      "requireNodeId": true,
+      "liveTimeoutMs": 60000
     }
   }
 }
@@ -102,9 +103,9 @@ SHA-256(
 )
 ```
 
-The current implementation recursively sorts object keys before serialization, but it is not yet a complete RFC 8785 JSON Canonicalization Scheme (JCS) implementation. Cross-SDK cache compatibility requires a normative encoding rather than relying on runtime-specific `JSON.stringify` behavior.
+Cache Key v2 uses RFC 8785 JSON Canonicalization Scheme (JCS) through the pinned `canonicalize` dependency. Cache identity includes an explicit key version, and valid v1 pointers are lazily migrated to v2 after full request and object validation.
 
-Target normalization rules:
+Normalization rules:
 
 1. Canonicalize arguments with RFC 8785 JCS before hashing.
 2. Normalize Figma `nodeId` from `123-456` to `123:456` before both lookup and live execution.
@@ -173,9 +174,9 @@ flowchart TD
 
 ## Concurrency and singleflight
 
-Atomic object publication and pointer replacement protect on-disk integrity, but they do not prevent duplicate live calls when concurrent requests miss the same key.
+Atomic object publication and pointer replacement protect on-disk integrity. Process-local singleflight additionally collapses concurrent live calls for the same Cache Key v2 identity.
 
-Planned singleflight behavior:
+Implemented singleflight behavior:
 
 ```text
 first miss for cache key
@@ -189,9 +190,9 @@ concurrent misses for same key
   → do not contact MCP server
 ```
 
-The in-flight registry should be process-local and keyed by the final canonical cache key. Entries must be removed in `finally` on success, MCP error, cancellation, timeout, or archive failure. A later completion must not replace a pointer captured from a logically newer request; pointer updates should compare capture timestamps or generation numbers before publication.
+The in-flight registry is process-local, state-scoped, and keyed by the final v2 cache key. The shared live call uses the session-owner signal rather than an individual caller signal; individual waiters may cancel without cancelling the leader. Entries are removed in `finally` after success or failure.
 
-Cross-process request collapsing remains future work. File locking alone can serialize pointer writes but cannot safely share an in-flight MCP response between processes.
+Cross-process request collapsing and pointer generation ordering remain future work. File locking alone can serialize pointer writes but cannot safely share an in-flight MCP response between processes.
 
 ## Tool usage
 
@@ -315,8 +316,8 @@ The bundled `figma-mcp-cache` skill instructs new agents to:
 
 | Topic | Decision | Remaining work |
 |---|---|---|
-| JSON canonicalization | Adopt RFC 8785 JCS and explicit Figma `nodeId` normalization | Replace the current recursive-key-sort serializer and add cross-runtime vectors |
-| Concurrent cache misses | Add process-local singleflight per canonical cache key | Define cancellation ownership and pointer generation ordering; evaluate cross-process coordination later |
+| JSON canonicalization | RFC 8785 JCS and explicit Figma `nodeId` normalization implemented in Cache Key v2 | Expand cross-runtime vectors and monitor v1 lazy migration |
+| Concurrent cache misses | Process-local, state-scoped singleflight implemented per v2 cache key | Add cross-process coordination and pointer generation ordering later |
 | Figma revision / last-modified | Store and validate it when the MCP server exposes trustworthy revision metadata | Current Figma Desktop raw results expose neither revision nor `lastModified`; TTL/refresh remain authoritative |
 | Direct archive promotion | Support through an explicit reviewed CLI with `--namespace` and `--dry-run` | Preserve capture time, require provenance, reject ambiguous/error/incomplete entries |
 | Historical promotion freshness | Treat as historical evidence, never as a fresh fetch | Require explicit read TTL and prohibit verification-status upgrades without live `refresh` |

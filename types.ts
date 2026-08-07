@@ -451,6 +451,8 @@ export interface McpReadCacheSettings {
   defaultMaxAgeSeconds?: number;
   /** Require args.nodeId to prevent caching dynamic current-selection calls. Defaults to true. */
   requireNodeId?: boolean;
+  /** Maximum duration for a shared live singleflight call. Defaults to 60000 ms. */
+  liveTimeoutMs?: number;
 }
 
 export interface McpResultArchiveSettings {
