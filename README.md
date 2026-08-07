@@ -444,6 +444,42 @@ mcpCache({
 
 `prefer-cache` returns a valid hit without contacting the MCP server, `cache-only` never makes a live call, and `refresh` always calls the server and updates the pointer. Only exact `server/original-tool` entries in `allowTools` can run. The bundled `figma-mcp-cache` skill teaches newly started agents to extract the Figma file/branch key as namespace, prefer `mcpCache` over direct Figma reads, and stop direct retries after rate limiting. With `requireNodeId` enabled (the default), dynamic current-selection requests are rejected. MCP error results and oversized archived results are never published as hits.
 
+#### Cache policy and freshness
+
+| Use case | Policy | Contacts MCP server | May return older data | Suggested age window | Proves current design state |
+|---|---|---:|---:|---:|---:|
+| Check whether a design/spec changed | `refresh` | Yes | No | N/A | Yes, when the live call succeeds |
+| Formal drift verification | `refresh` | Yes | No | N/A | Yes, when all required evidence succeeds |
+| First read or ordinary repeated work | `prefer-cache` | Only on miss/expiry | Yes | 3,600 seconds | No |
+| Re-read within one working session | `prefer-cache` | No on hit | Yes, up to the age window | 3,600 seconds | No |
+| Use existing evidence during rate limiting | `cache-only` | No | Yes | 86,400 seconds | No |
+| Offline evidence review | `cache-only` | No | Yes | Explicitly chosen by caller | No |
+| Force pointer replacement | `refresh` | Yes | No | N/A | Yes, when the live call succeeds |
+| Figma active tab is unconfirmed | Do not call | No | No data used | N/A | No |
+| Missing file/branch namespace | Do not use cache | Depends on explicit live workflow | Unsafe to determine | N/A | No |
+| Missing `nodeId` / current selection | Do not use cache | Depends on explicit live workflow | Unsafe to determine | N/A | No |
+| MCP returns an error | No pointer is published | Yes for the attempted live call | Error is never a hit | N/A | No |
+
+| Policy | Reads cache first | Live call on miss | Replaces cache pointer | Appropriate during rate limiting |
+|---|---:|---:|---:|---:|
+| `prefer-cache` | Yes | Yes | On successful miss call | No; a miss retries the limited server |
+| `cache-only` | Yes | Never | No | Yes |
+| `refresh` | No | Always | On successful live call | No |
+
+#### Evidence status guidance
+
+| Evidence source | Safe claim | Do not claim |
+|---|---|---|
+| Successful `refresh` with all required context/screenshots | Current evidence was verified; mark aligned/official only if domain rules also pass | Nothing beyond the returned evidence |
+| Successful `refresh` but missing required screenshot/context | Partial or unverifiable | Full verification completed |
+| `prefer-cache` hit | Cached evidence matches the inspected reference | The current Figma file has not changed |
+| `cache-only` hit | Historical cached evidence is available, with age/source reported | The result represents the latest design |
+| `cache-only` miss | No reusable namespaced cache exists | Guessed or reconstructed design content |
+| Rate-limit response | Blocked/unverifiable; switch to `cache-only` without direct retries | Repeated probes to test whether the limit reset |
+| Node absent from active Figma tab | Active-file mismatch | Rate limiting |
+
+Use `refresh` for requests such as “check whether the Figma spec changed.” During a quota lockout, `cache-only` is deliberately stale-evidence mode: report the cache age/source and do not upgrade verification status based on that hit alone.
+
 ### MCP Scripting
 
 For multi-call MCP work, write ordinary JavaScript: discover, inspect, call, loop, filter, chain, or fan out, then return one result. Run that code with the default-on `mcpScript` tool. For a single MCP call, search, describe, status check, or auth action, use `mcp` instead. Set `settings.scriptMode` to `false` to hide the scripting tool.
