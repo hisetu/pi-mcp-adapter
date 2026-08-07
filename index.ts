@@ -19,6 +19,7 @@ import { createMcpRuntimeOwner, createOwnedUi, isAbortError, type McpRuntimeOwne
 import { publishMcpStatusShutdown } from "./mcp-status.ts";
 import { runMcpScript } from "./mcp-code.ts";
 import { createMcpCacheExecutor, type McpCacheParams } from "./mcp-cache.ts";
+import { runMcpCacheCommand } from "./mcp-cache-command.ts";
 
 export type { McpAdapterOptions } from "./types.ts";
 export {
@@ -565,6 +566,43 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
           }
           break;
       }
+    },
+  });
+
+  pi.registerCommand("mcp-cache", {
+    description: "Inspect and manage the MCP result cache",
+    getArgumentCompletions: (prefix: string) => {
+      const normalized = prefix.trimStart();
+      const commands = [
+        { value: "status", label: "status — Show archive and pointer inventory" },
+        { value: "list", label: "list — List reusable cache pointers" },
+        { value: "inspect", label: "inspect — Inspect a cache key prefix" },
+        { value: "promote", label: "promote — Dry-run or apply archive promotion" },
+        { value: "help", label: "help — Show command usage" },
+      ].filter(({ value }) => value.startsWith(normalized));
+      return commands.length > 0 ? commands : null;
+    },
+    handler: async (args, ctx) => {
+      const commandOwner = currentOwner;
+      if (!state && initPromise) {
+        try {
+          state = await initPromise;
+          commandOwner?.throwIfInactive();
+        } catch (error) {
+          if (ctx.hasUI) ctx.ui.notify(`MCP initialization failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+          return;
+        }
+      }
+      if (!state) {
+        if (ctx.hasUI) ctx.ui.notify("MCP not initialized", "error");
+        return;
+      }
+      commandOwner?.throwIfInactive();
+      const result = await runMcpCacheCommand(state, args ?? "");
+      if (ctx.hasUI) {
+        if (result.level === "error") ctx.ui.notify(result.text, "error");
+        else await ctx.ui.editor("MCP Cache", result.text);
+      } else console.log(result.text);
     },
   });
 

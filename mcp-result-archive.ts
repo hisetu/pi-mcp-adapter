@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { link, lstat, mkdir, open, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, open, readFile, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { getAgentPath } from "./agent-dir.ts";
@@ -55,6 +55,29 @@ export interface ReadMcpResultCacheInput {
   maxAgeSeconds: number;
 }
 
+export interface PromoteMcpArchiveEntryInput {
+  settings?: McpSettings | undefined;
+  definition?: ServerEntry | undefined;
+  serverName: string;
+  entryId: string;
+  namespace: string;
+  apply: boolean;
+}
+
+export interface PromoteMcpArchiveEntryResult {
+  applied: boolean;
+  reason: "dry-run" | "applied" | "pointer-exists";
+  entryId: string;
+  entryPath: string;
+  capturedAt: string;
+  server: string;
+  tool: string;
+  nodeId?: string;
+  namespace: string;
+  cacheKey: string;
+  ageMs: number;
+}
+
 export interface ArchiveMcpToolResultInput {
   settings?: McpSettings | undefined;
   definition?: ServerEntry | undefined;
@@ -82,6 +105,12 @@ type ArchivePointer = {
 
 const warnedArchiveErrors = new Set<string>();
 
+export function resolveMcpResultArchiveDirectory(settings: McpSettings | undefined): string {
+  const configured = settings?.resultArchive;
+  const tuning = typeof configured === "object" && configured !== null ? configured : undefined;
+  return resolveArchiveDirectory(process.env.MCP_RESULT_ARCHIVE_DIR?.trim() || tuning?.directory);
+}
+
 export function resolveMcpResultArchiveOptions(
   settings: McpSettings | undefined,
   definition: ServerEntry | undefined,
@@ -95,9 +124,7 @@ export function resolveMcpResultArchiveOptions(
     : configured === true;
   const serverAllowed = !tuning?.servers?.length || tuning.servers.includes(serverName);
   const enabled = envEnabled ?? definition?.resultArchive ?? (globallyEnabled && serverAllowed);
-  const directory = resolveArchiveDirectory(
-    process.env.MCP_RESULT_ARCHIVE_DIR?.trim() || tuning?.directory,
-  );
+  const directory = resolveMcpResultArchiveDirectory(settings);
 
   return {
     enabled,
@@ -238,6 +265,95 @@ async function readCacheKey(
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return { hit: false, cacheKey, reason: "miss" };
     return { hit: false, cacheKey, reason: "invalid" };
   }
+}
+
+export async function promoteMcpArchiveEntry(
+  input: PromoteMcpArchiveEntryInput,
+): Promise<PromoteMcpArchiveEntryResult> {
+  const options = resolveMcpResultArchiveOptions(input.settings, input.definition, input.serverName);
+  if (!options.enabled) throw new Error("MCP result archive is disabled for this server");
+  const namespace = input.namespace.trim();
+  if (!namespace) throw new Error("A stable namespace is required for promotion");
+
+  const matched = await findArchiveEntry(options.directory, input.serverName, input.entryId);
+  const entry = matched.entry;
+  if (
+    entry.version !== MCP_RESULT_ARCHIVE_SCHEMA_VERSION
+    || entry.server !== input.serverName
+    || typeof entry.tool !== "string"
+    || typeof entry.timestamp !== "string"
+  ) throw new Error("Archive entry identity is invalid");
+  const result = asRecord(entry.result);
+  if (!result || result.status !== "archived" || result.isError === true) {
+    throw new Error("Only complete successful archive entries can be promoted");
+  }
+  const request = asRecord(entry.request);
+  if (!request?.arguments || request.argumentsOmitted === true) {
+    throw new Error("Archive entry arguments are unavailable");
+  }
+  const archivedArguments = await readArchivedJson(options.directory, request.arguments);
+  if (!asRecord(archivedArguments)) throw new Error("Archive entry arguments are invalid");
+  const normalizedArguments = normalizeMcpCacheArguments(archivedArguments as Record<string, unknown>);
+  const cacheKey = computeMcpResultCacheKeyV2({
+    namespace,
+    serverName: input.serverName,
+    toolName: entry.tool,
+    arguments: normalizedArguments,
+  });
+  const ageMs = Date.now() - Date.parse(entry.timestamp);
+  if (!Number.isFinite(ageMs) || ageMs < 0) throw new Error("Archive entry timestamp is invalid");
+  const preview: PromoteMcpArchiveEntryResult = {
+    applied: false,
+    reason: "dry-run",
+    entryId: String(entry.id ?? input.entryId),
+    entryPath: matched.path,
+    capturedAt: entry.timestamp,
+    server: input.serverName,
+    tool: entry.tool,
+    ...(typeof normalizedArguments.nodeId === "string" ? { nodeId: normalizedArguments.nodeId } : {}),
+    namespace,
+    cacheKey,
+    ageMs,
+  };
+  if (!input.apply) return preview;
+  try {
+    await lstat(cachePointerPath(options.directory, cacheKey));
+    return { ...preview, reason: "pointer-exists" };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+
+  const promotedEntry = {
+    ...entry,
+    id: `${String(entry.id ?? input.entryId)}-promoted-${randomBytes(4).toString("hex")}`,
+    origin: "promotion",
+    namespace,
+    cacheKey,
+    cacheKeyVersion: MCP_CACHE_KEY_VERSION,
+    promotion: {
+      sourceEntryPath: relative(options.directory, matched.path),
+      promotedAt: new Date().toISOString(),
+    },
+  };
+  const promotedPath = await writeEntry(options.directory, input.serverName, entry.timestamp, promotedEntry);
+  const published = await writeCachePointerIfAbsent(options.directory, cacheKey, {
+    version: MCP_RESULT_ARCHIVE_SCHEMA_VERSION,
+    cacheKey,
+    cacheKeyVersion: MCP_CACHE_KEY_VERSION,
+    entryCacheKey: cacheKey,
+    timestamp: entry.timestamp,
+    namespace,
+    server: input.serverName,
+    tool: entry.tool,
+    entryPath: relative(options.directory, promotedPath),
+  });
+  if (!published) await unlink(promotedPath).catch(() => {});
+  return {
+    ...preview,
+    entryPath: published ? promotedPath : matched.path,
+    applied: published,
+    reason: published ? "applied" : "pointer-exists",
+  };
 }
 
 export async function archiveMcpToolResult(
@@ -432,6 +548,39 @@ async function writeObject(
     mediaType,
     encoding,
   };
+}
+
+async function findArchiveEntry(
+  root: string,
+  serverName: string,
+  entryId: string,
+): Promise<{ path: string; entry: Recordish }> {
+  const directory = resolve(root, "entries", safePathSegment(serverName));
+  const pending = [directory];
+  const matches: Array<{ path: string; entry: Recordish }> = [];
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    let children;
+    try {
+      children = await readdir(current, { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
+    for (const child of children) {
+      const path = resolve(current, child.name);
+      if (child.isDirectory()) pending.push(path);
+      else if (child.isFile() && child.name.endsWith(".json")) {
+        const entry = JSON.parse((await readPrivateArchiveFile(root, path)).toString("utf8")) as Recordish;
+        if (entry.id === entryId || child.name === entryId || child.name === `${entryId}.json`) {
+          matches.push({ path, entry });
+        }
+      }
+    }
+  }
+  if (matches.length === 0) throw new Error(`Archive entry not found: ${entryId}`);
+  if (matches.length > 1) throw new Error(`Archive entry is ambiguous: ${entryId}`);
+  return matches[0]!;
 }
 
 async function writeCachePointer(root: string, cacheKey: string, pointer: ArchivePointer): Promise<void> {

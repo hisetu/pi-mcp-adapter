@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added an opt-in raw MCP result archive that captures proxy, direct, and `mcpScript` `callTool` results before output guarding, with private content-addressed storage, per-server controls, and payload size limits.
 - Added the explicit `mcpCache` read-through tool with stable namespaces, exact tool allowlists, TTLs, and `prefer-cache`, `cache-only`, and `refresh` policies, plus a bundled Figma cache skill that steers new agents away from repeated direct reads.
 - Added RFC 8785 Cache Key v2 with Figma node ID normalization, lazy v1 pointer migration, and state-scoped singleflight so concurrent misses share one live MCP call.
+- Added the Pi `/mcp-cache` management command for cache inventory, pointer listing/inspection, and dry-run-by-default archive promotion.
 
 ## [2.20.1] - 2026-08-04
 

@@ -95,6 +95,7 @@
     "mcp-result-archive.ts",
     "mcp-cache.ts",
     "mcp-cache-key.ts",
+    "mcp-cache-command.ts",
     "mcp-code.ts",
     "mcp-script-worker.mjs",
     "mcp-probe.ts",

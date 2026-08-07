@@ -394,6 +394,17 @@ The optional result archive preserves raw MCP `CallToolResult` payloads before `
 
 See **[MCP Result Archive and Read-through Cache Plan](docs/result-cache-plan.md)** for configuration, storage layout, the Mermaid call chain, policy/freshness matrices, integrity rules, rollout phases, and open questions.
 
+Manage the archive from Pi with:
+
+```text
+/mcp-cache status
+/mcp-cache list [--server name] [--tool name] [--namespace key] [--limit N]
+/mcp-cache inspect <cache-key-prefix>
+/mcp-cache promote <entry-id> --server name --namespace key [--apply]
+```
+
+Promotion defaults to dry-run. Review the capture time, age, provenance, normalized node ID, and v2 cache key before rerunning with `--apply`.
+
 ### MCP Scripting
 
 For multi-call MCP work, write ordinary JavaScript: discover, inspect, call, loop, filter, chain, or fan out, then return one result. Run that code with the default-on `mcpScript` tool. For a single MCP call, search, describe, status check, or auth action, use `mcp` instead. Set `settings.scriptMode` to `false` to hide the scripting tool.

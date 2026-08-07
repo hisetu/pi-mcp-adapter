@@ -8,6 +8,7 @@
 - Transparent interception of direct MCP tools: intentionally not implemented
 - RFC 8785 canonicalization and Figma `nodeId` normalization: implemented as Cache Key v2 with v1 lazy migration
 - Same-process singleflight for concurrent misses: implemented
+- Pi `/mcp-cache` status/list/inspect/promote management command: implemented
 - Retention, mark-and-sweep GC, and archive size ceiling: planned
 - Windows private ACL support: not implemented; raw archiving fails closed
 
@@ -193,6 +194,21 @@ concurrent misses for same key
 The in-flight registry is process-local, state-scoped, and keyed by the final v2 cache key. The shared live call uses the session-owner signal rather than an individual caller signal; individual waiters may cancel without cancelling the leader. Entries are removed in `finally` after success or failure.
 
 Cross-process request collapsing and pointer generation ordering remain future work. File locking alone can serialize pointer writes but cannot safely share an in-flight MCP response between processes.
+
+## Pi management command
+
+```text
+/mcp-cache status
+/mcp-cache list [--server name] [--tool name] [--namespace key] [--limit N]
+/mcp-cache inspect <cache-key-prefix>
+/mcp-cache promote <entry-id> --server name --namespace key [--apply]
+```
+
+- `status` reports entry, pointer, object, byte, tool, key-version, and age inventory.
+- `list` filters reusable pointers and defaults to the newest 30.
+- `inspect` resolves a unique cache-key prefix and displays pointer, request, result summary, and age.
+- `promote` is dry-run by default. `--apply` uses exclusive pointer publication and never overwrites an existing v2 pointer.
+- Promotion preserves the original capture timestamp and rejects errors, omitted results, missing arguments, ambiguous IDs, and unsafe archive references.
 
 ## Tool usage
 
