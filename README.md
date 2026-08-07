@@ -446,38 +446,43 @@ mcpCache({
 
 #### Read-through call chain
 
-```text
-Agent
-  └─ mcpCache(server, tool, namespace, args, policy, maxAgeSeconds)
-       ├─ validate resultCache enabled
-       ├─ validate namespace + explicit nodeId
-       ├─ resolve original MCP tool
-       ├─ enforce exact allowTools entry
-       ├─ enforce server enabled state + approval policy
-       ├─ verify backing resultArchive is enabled
-       └─ branch by policy
-            ├─ prefer-cache
-            │    ├─ compute SHA-256(namespace + server + tool + canonical args)
-            │    ├─ read cache pointer → archive entry → content-addressed objects
-            │    ├─ validate TTL, namespace, request identity, paths, and hashes
-            │    ├─ hit → reconstruct raw CallToolResult → outputGuard → Agent
-            │    └─ miss/expired → live executeCall
-            ├─ cache-only
-            │    ├─ perform the same validated cache lookup
-            │    ├─ hit → reconstruct raw CallToolResult → outputGuard → Agent
-            │    └─ miss/expired → return cache_miss; never contact MCP server
-            └─ refresh
-                 └─ skip lookup → live executeCall
+```mermaid
+flowchart TD
+    A[Agent] --> B["mcpCache(server, tool, namespace, args, policy, maxAgeSeconds)"]
+    B --> V["Validate cache enabled, namespace, nodeId, allowlist, server state, approval, and archive"]
+    V --> OK{Validation passed?}
+    OK -- No --> ERR[Return cache error without contacting MCP]
+    OK -- Yes --> P{Policy}
 
-live executeCall
-  └─ MCP client.callTool
-       ├─ raw CallToolResult
-       ├─ result archive (before outputGuard)
-       │    ├─ arguments/content → SHA-256 objects
-       │    ├─ append invocation entry
-       │    └─ successful namespaced result → atomically replace cache pointer
-       ├─ outputGuard / model-facing truncation
-       └─ Agent (cache=miss or cache=refresh)
+    P -- prefer-cache --> K["Compute SHA-256 of namespace + server + tool + canonical args"]
+    P -- cache-only --> K
+    P -- refresh --> LIVE[Live executeCall]
+
+    K --> LOOKUP["Read pointer → archive entry → content-addressed objects"]
+    LOOKUP --> VERIFY["Validate TTL, namespace, request identity, paths, and hashes"]
+    VERIFY --> HIT{Valid hit?}
+    HIT -- Yes --> RESTORE[Reconstruct raw CallToolResult]
+    RESTORE --> GUARD_HIT[Apply outputGuard]
+    GUARD_HIT --> RETURN_HIT[Return to Agent with cache=hit]
+
+    HIT -- No --> ONLY{Policy is cache-only?}
+    ONLY -- Yes --> MISS[Return cache_miss; never contact MCP]
+    ONLY -- No --> LIVE
+
+    LIVE --> CALL[MCP client.callTool]
+    CALL --> RAW[Raw CallToolResult]
+    RAW --> ARCHIVE["Archive before outputGuard"]
+    ARCHIVE --> OBJECTS["Write arguments/content as SHA-256 objects"]
+    OBJECTS --> ENTRY[Append invocation entry]
+    ENTRY --> SUCCESS{Successful namespaced result?}
+    SUCCESS -- Yes --> POINTER[Atomically replace cache pointer]
+    SUCCESS -- No --> NO_POINTER[Do not publish pointer]
+    POINTER --> GUARD_LIVE[Apply outputGuard]
+    NO_POINTER --> GUARD_LIVE
+    GUARD_LIVE --> RETURN_LIVE[Return to Agent with cache=miss or cache=refresh]
+
+    DIRECT[Direct figma_* tool call] --> CALL
+    DIRECT -. no namespace .-> NO_POINTER
 ```
 
 | Stage | Cache hit | Cache miss / `refresh` | Direct `figma_*` call |
