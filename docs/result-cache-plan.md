@@ -6,6 +6,9 @@
 - Explicit read-through tool: implemented as `mcpCache` behind `settings.resultCache`
 - Figma agent guidance: bundled as `figma-mcp-cache`
 - Transparent interception of direct MCP tools: intentionally not implemented
+- RFC 8785 canonicalization and Figma `nodeId` normalization: planned
+- Same-process singleflight for concurrent misses: planned
+- Retention, mark-and-sweep GC, and archive size ceiling: planned
 - Windows private ACL support: not implemented; raw archiving fails closed
 
 ## Problem
@@ -88,7 +91,7 @@ archive/
 
 macOS/Linux directories use mode `0700`; files use `0600`. Existing unsafe directories are rejected rather than silently chmodded. Windows is currently unsupported because private ACL provisioning is not implemented.
 
-## Cache identity
+## Cache identity and normalization
 
 ```text
 SHA-256(
@@ -99,12 +102,23 @@ SHA-256(
 )
 ```
 
+The current implementation recursively sorts object keys before serialization, but it is not yet a complete RFC 8785 JSON Canonicalization Scheme (JCS) implementation. Cross-SDK cache compatibility requires a normative encoding rather than relying on runtime-specific `JSON.stringify` behavior.
+
+Target normalization rules:
+
+1. Canonicalize arguments with RFC 8785 JCS before hashing.
+2. Normalize Figma `nodeId` from `123-456` to `123:456` before both lookup and live execution.
+3. Reject percent-encoded node IDs such as `123%3A456` at the cache boundary instead of creating a second identity.
+4. Trim and validate namespace, server, and tool names without changing case-sensitive semantic values.
+5. Resolve prefixed tool names to the original MCP tool name before hashing.
+6. Preserve array order and string values; do not normalize domain values such as `clientFrameworks` beyond documented schema rules.
+
 For Figma URLs:
 
 - `/design/<fileKey>/...?...node-id=123-456` → namespace `<fileKey>`, node ID `123:456`
 - `/design/<fileKey>/branch/<branchKey>/...` → namespace `<branchKey>`
 
-A namespace and explicit `nodeId` are required by default. Direct `figma_*` calls have no namespace, so their results can be archived but do not create reusable pointers.
+A namespace and explicit normalized `nodeId` are required by default. Direct `figma_*` calls have no namespace, so their results can be archived but do not create reusable pointers.
 
 ## Read-through call chain
 
@@ -156,6 +170,28 @@ flowchart TD
 | Publishes reusable pointer | Already exists | Successful namespaced results only | No namespace, so no pointer |
 | Applies `outputGuard` | Yes | Yes | Yes |
 | MCP error becomes a hit | Never | Never | Never |
+
+## Concurrency and singleflight
+
+Atomic object publication and pointer replacement protect on-disk integrity, but they do not prevent duplicate live calls when concurrent requests miss the same key.
+
+Planned singleflight behavior:
+
+```text
+first miss for cache key
+  → becomes leader
+  → performs one live MCP call
+  → archives result and updates pointer
+
+concurrent misses for same key
+  → join leader promise
+  → receive the same guarded result
+  → do not contact MCP server
+```
+
+The in-flight registry should be process-local and keyed by the final canonical cache key. Entries must be removed in `finally` on success, MCP error, cancellation, timeout, or archive failure. A later completion must not replace a pointer captured from a logically newer request; pointer updates should compare capture timestamps or generation numbers before publication.
+
+Cross-process request collapsing remains future work. File locking alone can serialize pointer writes but cannot safely share an in-flight MCP response between processes.
 
 ## Tool usage
 
@@ -255,18 +291,39 @@ The bundled `figma-mcp-cache` skill instructs new agents to:
 - Import historical Pi session results.
 - Promote only entries with a verified file/branch namespace.
 - Reject errors, incomplete/truncated data, and ambiguous file identity.
-- Record provenance and original capture time.
+- Preserve the original capture timestamp; promotion must never make old evidence appear newly fetched.
+- Require an explicit `maxAgeSeconds` when reading promoted data.
+- Default promoted evidence to a short or review-specific TTL and never use it to prove current Figma state without `refresh`.
+- Provide a reviewed command such as `pi-mcp-cache promote <entry-id> --namespace <key> --dry-run` that shows provenance, age, arguments, and target cache key before publication.
 
 ### Phase 4 — Operations
 
 - Add cache inventory, hit/miss counters, invalidation, and pruning commands.
 - Report saved MCP calls and storage usage.
-- Add retention policies without deleting unique evidence unexpectedly.
+- Add dual retention controls:
+  - pointers follow short TTL/freshness policy
+  - raw invocation entries follow configurable age and total-size limits
+- Add mark-and-sweep GC:
+  1. mark every object referenced by retained entries and pointers
+  2. sweep unreferenced objects after a grace period
+  3. verify hashes and refuse deletion when the reference scan is incomplete
+- Add a configurable archive ceiling (for example 5 GiB by default, with an explicit higher limit for audit-heavy deployments).
+- When over the ceiling, remove the oldest eligible entries according to retention policy, then sweep orphan objects. Do not use object filesystem mtime as LRU evidence because deduplicated objects are shared.
+- Keep unique evidence unless the configured retention policy explicitly permits deletion.
 
-## Open questions
+## Design decisions and open work
 
-- Should cache pointers support Figma revision/last-modified data if the server exposes it later?
-- Should successful direct archive entries be promotable through a reviewed CLI command?
-- What retention policy should apply to append-only invocation entries?
-- Should Windows support provision private ACLs or keep failing closed?
-- Should approval be recorded separately for cache hits versus live calls?
+| Topic | Decision | Remaining work |
+|---|---|---|
+| JSON canonicalization | Adopt RFC 8785 JCS and explicit Figma `nodeId` normalization | Replace the current recursive-key-sort serializer and add cross-runtime vectors |
+| Concurrent cache misses | Add process-local singleflight per canonical cache key | Define cancellation ownership and pointer generation ordering; evaluate cross-process coordination later |
+| Figma revision / last-modified | Store and validate it when the MCP server exposes trustworthy revision metadata | Current Figma Desktop raw results expose neither revision nor `lastModified`; TTL/refresh remain authoritative |
+| Direct archive promotion | Support through an explicit reviewed CLI with `--namespace` and `--dry-run` | Preserve capture time, require provenance, reject ambiguous/error/incomplete entries |
+| Historical promotion freshness | Treat as historical evidence, never as a fresh fetch | Require explicit read TTL and prohibit verification-status upgrades without live `refresh` |
+| Retention | Use pointer TTL plus raw archive age/size limits | Implement inventory, retention planning, mark-and-sweep GC, and orphan grace periods |
+| Windows | Keep disk archive fail-closed until private ACLs are implemented | Consider an explicitly selected memory-only tier as a temporary feature; do not silently downgrade durable archive security |
+| Approval audit | Record cache-hit approval separately from live-call approval | Add audit event types such as `APPROVAL_CACHE_HIT` and `APPROVAL_LIVE_CALL` without storing secrets |
+
+### Windows position
+
+A silent fallback to disk under `%LOCALAPPDATA%` is not sufficient by itself because path convention does not prove the ACL is private. Short term, Windows remains fail-closed for durable raw archives. A future opt-in memory-only tier may provide basic read-through behavior without persistence, while durable Windows support should provision and verify a user-only ACL through a reviewed native mechanism.
