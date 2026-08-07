@@ -69,8 +69,8 @@ When Figma says the rate limit is exceeded:
 
 1. Stop all direct `figma_desktop_*` and `figma_*` retries.
 2. Do not probe another node to test whether the limit reset.
-3. Retry the required request through `mcpCache` with `policy: "cache-only"` and the correct namespace.
-4. If it misses, state that no reusable namespaced cache exists. Do not claim that an archive-only entry is a hit.
+3. Retry the required request through `mcpCache` with `policy: "cache-only"`, the correct namespace, and `maxAgeSeconds: 86400` unless the user requires a stricter freshness window. This allows yesterday's verified evidence to remain useful during a daily quota lockout.
+4. If it still misses or is older than the allowed window, state that no reusable namespaced cache exists. Do not claim that an archive-only entry is a hit.
 5. Continue only with the evidence actually returned from cache.
 
 ## Safety rules
