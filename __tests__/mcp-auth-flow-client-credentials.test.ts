@@ -141,8 +141,88 @@ describe("mcp-auth-flow explicit auth", () => {
       `code=auth-code&state=${oauthState}&iss=${encodeURIComponent("https://auth.example.com")}`,
     )).resolves.toBe("authenticated");
     expect(mocks.sdkAuth).toHaveBeenCalledTimes(2);
+    expect(mocks.sdkAuth).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({
+      authorizationCode: "auth-code",
+      iss: "https://auth.example.com",
+    }));
     expect(hasPendingAuth("rfc9207-missing")).toBe(false);
   });
+
+  it.each(["manual redirect", "interactive callback"] as const)(
+    "forwards the callback issuer to the real SDK token exchange for %s",
+    async (completionMode) => {
+      const { exchangeAuthorization } = await vi.importActual<typeof import("@modelcontextprotocol/client")>(
+        "@modelcontextprotocol/client",
+      );
+      const issuer = "https://auth.example.com";
+      const serverUrl = "https://api.example.com/mcp";
+      const serverName = `rfc9207-${completionMode}`;
+      const metadata = {
+        issuer,
+        authorization_endpoint: `${issuer}/authorize`,
+        token_endpoint: `${issuer}/token`,
+        response_types_supported: ["code"],
+        token_endpoint_auth_methods_supported: ["none"],
+        authorization_response_iss_parameter_supported: true,
+      };
+      const tokenFetch = vi.fn(async () => new Response(JSON.stringify({
+        access_token: "test-access-token",
+        token_type: "Bearer",
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+      let oauthState = "";
+      mocks.sdkAuth.mockImplementation(async (provider, options) => {
+        if (options.authorizationCode) {
+          // Exercise the SDK's own RFC 9207 check, not an always-successful auth mock.
+          const tokens = await exchangeAuthorization(issuer, {
+            metadata,
+            clientInformation: { client_id: "test-client" },
+            authorizationCode: options.authorizationCode,
+            iss: options.iss,
+            codeVerifier: "test-code-verifier",
+            redirectUri: provider.redirectUrl,
+            fetchFn: tokenFetch,
+          });
+          await provider.saveTokens(tokens);
+          return "AUTHORIZED";
+        }
+        oauthState = await provider.state();
+        await provider.saveDiscoveryState({
+          authorizationServerUrl: issuer,
+          authorizationServerMetadata: metadata,
+        });
+        await provider.redirectToAuthorization(new URL(metadata.authorization_endpoint));
+        return "REDIRECT";
+      });
+      const { authenticate, completeAuthFromInput, hasPendingAuth, startAuth } = await import("../mcp-auth-flow.ts");
+      const { getAuthForUrl } = await import("../mcp-auth.ts");
+      const definition = { url: serverUrl, auth: "oauth" as const };
+
+      if (completionMode === "manual redirect") {
+        await startAuth(serverName, serverUrl, definition);
+        const redirect = new URL("http://localhost:19876/callback");
+        redirect.search = new URLSearchParams({ code: "auth-code", state: oauthState, iss: issuer }).toString();
+        await expect(completeAuthFromInput(serverName, redirect.href)).resolves.toBe("authenticated");
+      } else {
+        mocks.open.mockResolvedValue(undefined);
+        mocks.waitForCallback.mockImplementationOnce(async (state) => ({ code: "auth-code", state, iss: issuer }));
+        await expect(authenticate(serverName, serverUrl, definition, {
+          onAuthorizationUrl: vi.fn(),
+        })).resolves.toBe("authenticated");
+        expect(mocks.waitForCallback).toHaveBeenCalledWith(oauthState);
+      }
+
+      expect(mocks.sdkAuth).toHaveBeenCalledTimes(2);
+      expect(mocks.sdkAuth).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({
+        serverUrl,
+        authorizationCode: "auth-code",
+        iss: issuer,
+      }));
+      expect(tokenFetch).toHaveBeenCalledTimes(1);
+      expect((await getAuthForUrl(serverName, serverUrl))?.tokens?.accessToken).toBe("test-access-token");
+      expect(hasPendingAuth(serverName)).toBe(false);
+      expect(mocks.cancelPendingCallback).toHaveBeenCalledWith(oauthState);
+    },
+  );
 
   it("rejects a mismatched RFC 9207 issuer before token exchange", async () => {
     let oauthState = "";
